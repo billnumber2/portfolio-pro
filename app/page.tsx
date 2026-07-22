@@ -464,24 +464,30 @@ export default function Page() {
           .select("*")
           .eq("user_id", user.id)
           .order("updated_at", { ascending: false }),
-        supabase.from("trades").select("*").eq("user_id", user.id),
-        supabase.from("dividends").select("*").eq("user_id", user.id),
-      ]*;
+        supabase
+          .from("trades")
+          .select("*")
+          .eq("user_id", user.id),
+        supabase
+          .from("dividends")
+          .select("*")
+          .eq("user_id", user.id),
+      ]);
 
-    if (positionsResult.error |* tradesResult.error || dividendsRe*ult.error) {
-      return setStatu*(
-        positionsResult.error?.m*ssage ||
-          tradesResult.er*or?.message ||
-          dividends*esult.error?.message ||
-          *讀取雲端資料失敗。"
+    if (positionsResult.error || tradesResult.error || dividendsResult.error) {
+      return setStatus(
+        positionsResult.error?.message ||
+          tradesResult.error?.message ||
+          dividendsResult.error?.message ||
+          "讀取雲端資料失敗。"
       );
     }
 
-    set*ositions((positionsResult.data || *]).map(normalizePosition));
-    se*Trades((tradesResult.data || []).m*p(normalizeTrade));
-    setDividen*s((dividendsResult.data || []).map*normalizeDividend));
+    setPositions((positionsResult.data || []).map(normalizePosition));
+    setTrades((tradesResult.data || []).map(normalizeTrade));
+    setDividends((dividendsResult.data || []).map(normalizeDividend));
 
-    setStatu*("已從 Supabase 讀取資料。");
+    setStatus("已從 Supabase 讀取資料。");
   }
 
   asyn* function saveCloud() {
