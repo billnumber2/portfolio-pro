@@ -5,20 +5,24 @@ export async function GET(request: Request) {
   const symbol = String(searchParams.get("symbol") || "").trim().toUpperCase();
 
   if (!symbol) {
-    return NextResponse.json({ error: "symbol is required" }, { status: 400 });
+    return NextResponse.json(
+      { error: "symbol is required" },
+      { status: 400 }
+    );
   }
 
   try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
+    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
       symbol
     )}?modules=assetProfile`;
 
     const response = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         Accept: "application/json",
       },
-      next: { revalidate: 86400 },
+      cache: "no-store",
     });
 
     if (!response.ok) {
