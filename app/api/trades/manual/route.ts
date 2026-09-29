@@ -69,9 +69,15 @@ function buildPayload(body: ManualTradePayload) {
 
   if (!tradeDate) throw new Error("trade_date is required.");
   if (!symbol) throw new Error("symbol is required.");
-  if (!market || !["US", "TW"].includes(market)) throw new Error("market must be US or TW.");
+
+  if (!market || !["US", "TW"].includes(market)) {
+    throw new Error("market must be US or TW.");
+  }
+
   if (!["buy", "sell", "dividend", "split"].includes(side)) {
-    throw new Error("side must be buy, sell, dividend, or split.");
+    throw new Error(
+      "side must be buy, sell, dividend, or split."
+    );
   }
 
   return {
@@ -87,23 +93,33 @@ function buildPayload(body: ManualTradePayload) {
       currency,
       fee: toNumber(body.fee, 0),
       tax: toNumber(body.tax, 0),
-      exchange_rate: market === "TW" ? 1 : toNumber(body.exchange_rate, 1),
+      exchange_rate:
+        market === "TW"
+          ? 1
+          : toNumber(body.exchange_rate, 1),
       split_from: toNumber(body.split_from, 0),
       split_to: toNumber(body.split_to, 0),
       memo: normalizeText(body.memo) || "manual",
     },
+
     stockMasterPayload: {
       symbol,
       stock_name: stockName,
       market,
-      yahoo_symbol: getYahooSymbol(market, symbol),
+      yahoo_symbol: getYahooSymbol(
+        market,
+        symbol
+      ),
       sector: null,
       asset_type: "stock",
     },
   };
 }
 
-async function upsertStockMaster(supabase: ReturnType<typeof createClient>, stockMasterPayload: any) {
+async function upsertStockMaster(
+  supabase: any,
+  stockMasterPayload: any
+) {
   const { error } = await supabase
     .from("stock_master")
     .upsert(stockMasterPayload, {
@@ -114,13 +130,15 @@ async function upsertStockMaster(supabase: ReturnType<typeof createClient>, stoc
 }
 
 async function findDuplicateTrade(
-  supabase: ReturnType<typeof createClient>,
+  supabase: any,
   tradePayload: any,
   excludeId?: string
 ) {
   let query = supabase
     .from("trades")
-    .select("id, trade_date, market, symbol, side, shares, price")
+    .select(
+      "id, trade_date, market, symbol, side, shares, price"
+    )
     .eq("trade_date", tradePayload.trade_date)
     .eq("market", tradePayload.market)
     .eq("symbol", tradePayload.symbol)
@@ -134,29 +152,51 @@ async function findDuplicateTrade(
   }
 
   const { data, error } = await query;
+
   if (error) throw error;
+
   return data?.[0] || null;
 }
 
 export async function GET(request: Request) {
   try {
     const supabase = getSupabaseClient();
+
     const { searchParams } = new URL(request.url);
-    const limit = Math.min(Number(searchParams.get("limit") || 50), 500);
-    const symbol = normalizeSymbol(searchParams.get("symbol"));
-    const memo = normalizeText(searchParams.get("memo"));
+
+    const limit = Math.min(
+      Number(searchParams.get("limit") || 50),
+      500
+    );
+
+    const symbol = normalizeSymbol(
+      searchParams.get("symbol")
+    );
+
+    const memo = normalizeText(
+      searchParams.get("memo")
+    );
 
     let query = supabase
       .from("trades")
-      .select("id, trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to, memo, created_at")
-      
-      .order("created_at", { ascending: false })
+      .select(
+        "id, trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to, memo, created_at"
+      )
+      .order("created_at", {
+        ascending: false,
+      })
       .limit(limit);
 
-    if (symbol) query = query.eq("symbol", symbol);
-    if (memo) query = query.eq("memo", memo);
+    if (symbol) {
+      query = query.eq("symbol", symbol);
+    }
+
+    if (memo) {
+      query = query.eq("memo", memo);
+    }
 
     const { data, error } = await query;
+
     if (error) throw error;
 
     return NextResponse.json({
@@ -164,110 +204,198 @@ export async function GET(request: Request) {
       trades: data || [],
     });
   } catch (error: any) {
-    return NextResponse.json({ success: false, error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          error?.message || String(error),
+      },
+      {
+        status: 500,
+      }
+    );
   }
 }
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as ManualTradePayload;
-    const supabase = getSupabaseClient();
-    const { tradePayload, stockMasterPayload } = buildPayload(body);
+    const body =
+      (await request.json()) as ManualTradePayload;
 
-    const duplicate = await findDuplicateTrade(supabase, tradePayload);
+    const supabase = getSupabaseClient();
+
+    const {
+      tradePayload,
+      stockMasterPayload,
+    } = buildPayload(body);
+
+    const duplicate =
+      await findDuplicateTrade(
+        supabase,
+        tradePayload
+      );
+
     if (duplicate) {
       return NextResponse.json(
         {
           success: false,
-          error: "Duplicate trade detected. Please review recent 50 trades before inserting again.",
+          error:
+            "Duplicate trade detected. Please review recent 50 trades before inserting again.",
           duplicate,
         },
         { status: 409 }
       );
     }
 
-    const { data: insertedTrade, error: insertError } = await supabase
+    const {
+      data: insertedTrade,
+      error: insertError,
+    } = await supabase
       .from("trades")
       .insert(tradePayload)
-      .select("id, trade_date, market, symbol, side, shares, price")
+      .select(
+        "id, trade_date, market, symbol, side, shares, price"
+      )
       .single();
 
     if (insertError) throw insertError;
 
-    await upsertStockMaster(supabase, stockMasterPayload);
+    await upsertStockMaster(
+      supabase,
+      stockMasterPayload
+    );
 
     return NextResponse.json({
       success: true,
       trade: insertedTrade,
       stockMaster: stockMasterPayload,
-      nextSteps: ["Review recent 50 trades.", "Run one-click portfolio update."],
     });
   } catch (error: any) {
-    return NextResponse.json({ success: false, error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          error?.message || String(error),
+      },
+      {
+        status: 500,
+      }
+    );
   }
 }
 
 export async function PATCH(request: Request) {
   try {
-    const body = (await request.json()) as ManualTradePayload;
+    const body =
+      (await request.json()) as ManualTradePayload;
+
     const id = normalizeText(body.id);
 
     if (!id) {
-      return NextResponse.json({ success: false, error: "id is required." }, { status: 400 });
+      return NextResponse.json(
+        {
+          success: false,
+          error: "id is required.",
+        },
+        { status: 400 }
+      );
     }
 
     const supabase = getSupabaseClient();
-    const { tradePayload, stockMasterPayload } = buildPayload(body);
 
-    const duplicate = await findDuplicateTrade(supabase, tradePayload, id);
+    const {
+      tradePayload,
+      stockMasterPayload,
+    } = buildPayload(body);
+
+    const duplicate =
+      await findDuplicateTrade(
+        supabase,
+        tradePayload,
+        id
+      );
+
     if (duplicate) {
       return NextResponse.json(
         {
           success: false,
-          error: "Duplicate trade detected. Please review recent 50 trades before updating.",
+          error:
+            "Duplicate trade detected. Please review recent 50 trades before updating.",
           duplicate,
         },
         { status: 409 }
       );
     }
 
-    const { data: updatedTrade, error: updateError } = await supabase
+    const {
+      data: updatedTrade,
+      error: updateError,
+    } = await supabase
       .from("trades")
       .update(tradePayload)
       .eq("id", id)
-      .select("id, trade_date, market, symbol, side, shares, price")
+      .select(
+        "id, trade_date, market, symbol, side, shares, price"
+      )
       .single();
 
     if (updateError) throw updateError;
 
-    await upsertStockMaster(supabase, stockMasterPayload);
+    await upsertStockMaster(
+      supabase,
+      stockMasterPayload
+    );
 
     return NextResponse.json({
       success: true,
       trade: updatedTrade,
-      stockMaster: stockMasterPayload,
-      nextSteps: ["Review recent 50 trades.", "Run one-click portfolio update."],
     });
   } catch (error: any) {
-    return NextResponse.json({ success: false, error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          error?.message || String(error),
+      },
+      {
+        status: 500,
+      }
+    );
   }
 }
 
 export async function DELETE(request: Request) {
   try {
     const supabase = getSupabaseClient();
-    const { searchParams } = new URL(request.url);
-    const id = normalizeText(searchParams.get("id"));
+
+    const { searchParams } = new URL(
+      request.url
+    );
+
+    const id = normalizeText(
+      searchParams.get("id")
+    );
 
     if (!id) {
-      return NextResponse.json({ success: false, error: "id is required." }, { status: 400 });
+      return NextResponse.json(
+        {
+          success: false,
+          error: "id is required.",
+        },
+        { status: 400 }
+      );
     }
 
-    const { data: deletedTrade, error: deleteError } = await supabase
+    const {
+      data: deletedTrade,
+      error: deleteError,
+    } = await supabase
       .from("trades")
       .delete()
       .eq("id", id)
-      .select("id, trade_date, market, symbol, side, shares, price")
+      .select(
+        "id, trade_date, market, symbol, side, shares, price"
+      )
       .single();
 
     if (deleteError) throw deleteError;
@@ -275,9 +403,17 @@ export async function DELETE(request: Request) {
     return NextResponse.json({
       success: true,
       trade: deletedTrade,
-      nextSteps: ["Review recent 50 trades.", "Run one-click portfolio update."],
     });
   } catch (error: any) {
-    return NextResponse.json({ success: false, error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          error?.message || String(error),
+      },
+      {
+        status: 500,
+      }
+    );
   }
 }
