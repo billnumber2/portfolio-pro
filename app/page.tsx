@@ -31,6 +31,11 @@ const sharesFmt = new Intl.NumberFormat("zh-TW", {
   maximumFractionDigits: 6,
 });
 
+const amountFmt = new Intl.NumberFormat("zh-TW", {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 6,
+});
+
 type NumericLike = number | string | null | undefined;
 
 type DailyPositionRecord = {
@@ -66,6 +71,25 @@ type PortfolioPerformanceRecord = {
   unrealized_return_rate?: NumericLike;
 };
 
+type TradeRecord = {
+  id: string;
+  trade_date: string;
+  market: string | null;
+  symbol: string;
+  stock_name: string | null;
+  side: string;
+  shares: NumericLike;
+  price: NumericLike;
+  cash_amount: NumericLike;
+  currency: string | null;
+  fee: NumericLike;
+  tax: NumericLike;
+  exchange_rate: NumericLike;
+  split_from: NumericLike;
+  split_to: NumericLike;
+  memo: string | null;
+};
+
 function toNumber(value: unknown, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -83,6 +107,24 @@ function getCurrency(market: string, currency?: string) {
   return market === "US" ? "USD" : "TWD";
 }
 
+function getTradeTypeLabel(side: string) {
+  const labels: Record<string, string> = {
+    buy: "買進",
+    sell: "賣出",
+    dividend: "股利",
+    split: "分割",
+  };
+  return labels[side] || side;
+}
+
+function getTradeTypeClass(side: string) {
+  if (side === "buy") return "bg-blue-50 text-blue-700";
+  if (side === "sell") return "bg-amber-50 text-amber-700";
+  if (side === "dividend") return "bg-emerald-50 text-emerald-700";
+  if (side === "split") return "bg-purple-50 text-purple-700";
+  return "bg-slate-100 text-slate-700";
+}
+
 export default function Page() {
   const [fxRate, setFxRate] = useState(32.6);
   const [positions, setPositions] = useState<DailyPositionRecord[]>([]);
@@ -97,6 +139,11 @@ export default function Page() {
   const [updatingPortfolio, setUpdatingPortfolio] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
   const [updateResult, setUpdateResult] = useState<any>(null);
+
+  const [expandedPositionKey, setExpandedPositionKey] = useState<string | null>(null);
+  const [tradeHistory, setTradeHistory] = useState<Record<string, TradeRecord[]>>({});
+  const [tradeHistoryLoading, setTradeHistoryLoading] = useState<Record<string, boolean>>({});
+  const [tradeHistoryError, setTradeHistoryError] = useState<Record<string, string>>({});
 
   async function loadData() {
     setLoading(true);
@@ -182,6 +229,52 @@ export default function Page() {
     loadData();
   }, []);
 
+
+  async function handleExpandPosition(market: string, symbol: string) {
+    const positionKey = `${market}:${symbol}`;
+
+    if (expandedPositionKey === positionKey) {
+      setExpandedPositionKey(null);
+      return;
+    }
+
+    setExpandedPositionKey(positionKey);
+
+    if (tradeHistory[positionKey] || tradeHistoryLoading[positionKey]) return;
+
+    setTradeHistoryLoading((previous) => ({ ...previous, [positionKey]: true }));
+    setTradeHistoryError((previous) => ({ ...previous, [positionKey]: "" }));
+
+    try {
+      const { data, error } = await supabase
+        .from("trades")
+        .select(
+          "id, trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to, memo"
+        )
+        .eq("market", market)
+        .eq("symbol", symbol)
+        .order("trade_date", { ascending: false })
+        .order("id", { ascending: false });
+
+      if (error) throw error;
+
+      setTradeHistory((previous) => ({
+        ...previous,
+        [positionKey]: (data || []) as TradeRecord[],
+      }));
+    } catch (error: any) {
+      setTradeHistoryError((previous) => ({
+        ...previous,
+        [positionKey]: error?.message || String(error),
+      }));
+    } finally {
+      setTradeHistoryLoading((previous) => ({
+        ...previous,
+        [positionKey]: false,
+      }));
+    }
+  }
+
   async function handleUpdatePortfolio() {
     setUpdatingPortfolio(true);
     setUpdateMessage("投資組合更新中，請稍候...");
@@ -205,6 +298,8 @@ export default function Page() {
       }
 
       setUpdateMessage("一鍵更新完成，首頁資料已重新讀取。");
+      setExpandedPositionKey(null);
+      setTradeHistory({});
       await loadData();
     } catch (error: any) {
       setUpdateMessage(error?.message || String(error));
@@ -358,6 +453,7 @@ export default function Page() {
               <thead className="bg-slate-100">
                 <tr>
                   {[
+                    "",
                     "市場",
                     "代碼",
                     "名稱",
@@ -369,8 +465,11 @@ export default function Page() {
                     "未實現損益",
                     "報酬率",
                     "占比",
-                  ].map((header) => (
-                    <th key={header} className="p-3 text-left">
+                  ].map((header, headerIndex) => (
+                    <th
+                      key={`${header}-${headerIndex}`}
+                      className={headerIndex === 0 ? "w-10 p-3 text-center" : "p-3 text-left"}
+                    >
                       {header}
                     </th>
                   ))}
@@ -378,35 +477,170 @@ export default function Page() {
               </thead>
 
               <tbody>
-                {rows.map((row, index) => (
-                  <tr key={`${row.market}-${row.symbol}-${index}`} className="border-t">
-                    <td className="p-3">{row.market}</td>
-                    <td className="p-3 font-medium">{row.symbol}</td>
-                    <td className="p-3">{row.name}</td>
-                    <td className="p-3 text-right">
-                      {sharesFmt.format(row.shares)}
-                    </td>
-                    <td className="p-3 text-right">{num1.format(row.avgCost)}</td>
-                    <td className="p-3 text-right">{num1.format(row.price)}</td>
-                    <td className="p-3">{row.currency}</td>
-                    <td className="p-3 text-right">{twd.format(row.valueTwd)}</td>
-                    <td
-                      className={`p-3 text-right font-medium ${
-                        row.pnlTwd >= 0 ? "text-green-600" : "text-red-600"
-                      }`}
-                    >
-                      {twd.format(row.pnlTwd)}
-                    </td>
-                    <td
-                      className={`p-3 text-right ${
-                        row.returnRate >= 0 ? "text-green-600" : "text-red-600"
-                      }`}
-                    >
-                      {pct1.format(row.returnRate)}
-                    </td>
-                    <td className="p-3 text-right">{pct1.format(row.weight)}</td>
-                  </tr>
-                ))}
+                {rows.map((row, index) => {
+                  const positionKey = `${row.market}:${row.symbol}`;
+                  const isExpanded = expandedPositionKey === positionKey;
+                  const history = tradeHistory[positionKey] || [];
+                  const isHistoryLoading = Boolean(tradeHistoryLoading[positionKey]);
+                  const historyError = tradeHistoryError[positionKey];
+
+                  return (
+                    <React.Fragment key={`${row.market}-${row.symbol}-${index}`}>
+                      <tr
+                        className="cursor-pointer border-t transition hover:bg-slate-50"
+                        onClick={() => handleExpandPosition(row.market, row.symbol)}
+                        aria-expanded={isExpanded}
+                      >
+                        <td className="p-3 text-center text-slate-500">
+                          <span
+                            className={`inline-block transition-transform ${isExpanded ? "rotate-90" : ""}`}
+                            aria-hidden="true"
+                          >
+                            ▶
+                          </span>
+                        </td>
+                        <td className="p-3">{row.market}</td>
+                        <td className="p-3 font-medium text-blue-700">{row.symbol}</td>
+                        <td className="p-3">{row.name}</td>
+                        <td className="p-3 text-right">{sharesFmt.format(row.shares)}</td>
+                        <td className="p-3 text-right">{num1.format(row.avgCost)}</td>
+                        <td className="p-3 text-right">{num1.format(row.price)}</td>
+                        <td className="p-3">{row.currency}</td>
+                        <td className="p-3 text-right">{twd.format(row.valueTwd)}</td>
+                        <td
+                          className={`p-3 text-right font-medium ${
+                            row.pnlTwd >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {twd.format(row.pnlTwd)}
+                        </td>
+                        <td
+                          className={`p-3 text-right ${
+                            row.returnRate >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {pct1.format(row.returnRate)}
+                        </td>
+                        <td className="p-3 text-right">{pct1.format(row.weight)}</td>
+                      </tr>
+
+                      {isExpanded && (
+                        <tr className="border-t">
+                          <td colSpan={12} className="bg-slate-50 p-4 sm:p-5">
+                            <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                              <div>
+                                <p className="font-semibold text-slate-900">
+                                  {row.symbol} 全部歷史交易
+                                </p>
+                                <p className="text-xs text-slate-500">依交易日期由新到舊排列</p>
+                              </div>
+                              {!isHistoryLoading && !historyError && (
+                                <p className="text-xs text-slate-500">共 {history.length} 筆</p>
+                              )}
+                            </div>
+
+                            {isHistoryLoading && (
+                              <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">
+                                正在讀取 {row.symbol} 的交易紀錄...
+                              </div>
+                            )}
+
+                            {historyError && (
+                              <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                                讀取交易紀錄失敗：{historyError}
+                              </div>
+                            )}
+
+                            {!isHistoryLoading && !historyError && history.length === 0 && (
+                              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-700">
+                                找不到 {row.symbol} 的歷史交易紀錄。
+                              </div>
+                            )}
+
+                            {!isHistoryLoading && !historyError && history.length > 0 && (
+                              <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
+                                <table className="min-w-[1050px] w-full text-sm">
+                                  <thead className="bg-slate-100">
+                                    <tr>
+                                      {[
+                                        "日期",
+                                        "類型",
+                                        "股數",
+                                        "價格",
+                                        "股利／現金",
+                                        "手續費",
+                                        "稅",
+                                        "匯率",
+                                        "分割比例",
+                                        "Memo",
+                                      ].map((header) => (
+                                        <th
+                                          key={header}
+                                          className="whitespace-nowrap p-3 text-left font-medium text-slate-600"
+                                        >
+                                          {header}
+                                        </th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {history.map((trade) => {
+                                      const splitFrom = toNumber(trade.split_from);
+                                      const splitTo = toNumber(trade.split_to);
+                                      const splitLabel =
+                                        trade.side === "split" && splitFrom > 0 && splitTo > 0
+                                          ? `${amountFmt.format(splitFrom)} : ${amountFmt.format(splitTo)}`
+                                          : "-";
+
+                                      return (
+                                        <tr key={trade.id} className="border-t hover:bg-slate-50">
+                                          <td className="whitespace-nowrap p-3">{trade.trade_date}</td>
+                                          <td className="p-3">
+                                            <span
+                                              className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${getTradeTypeClass(
+                                                trade.side
+                                              )}`}
+                                            >
+                                              {getTradeTypeLabel(trade.side)}
+                                            </span>
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {sharesFmt.format(toNumber(trade.shares))}
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {amountFmt.format(toNumber(trade.price))}
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {trade.side === "dividend"
+                                              ? amountFmt.format(toNumber(trade.cash_amount))
+                                              : "-"}
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {amountFmt.format(toNumber(trade.fee))}
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {amountFmt.format(toNumber(trade.tax))}
+                                          </td>
+                                          <td className="p-3 text-right">
+                                            {amountFmt.format(toNumber(trade.exchange_rate, 1))}
+                                          </td>
+                                          <td className="whitespace-nowrap p-3 text-center">
+                                            {splitLabel}
+                                          </td>
+                                          <td className="p-3">{trade.memo || "-"}</td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
