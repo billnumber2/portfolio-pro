@@ -53,25 +53,26 @@ function round6(value: number) {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
-async function fetchAllPages<T>(baseQuery: any, pageSize = 1000): Promise<T[]> {
+async function fetchAllPages<T>(
+  createPageQuery: (from: number, to: number) => PromiseLike<{
+    data: T[] | null;
+    error: any;
+  }>,
+  pageSize = 1000
+): Promise<T[]> {
   const allRows: T[] = [];
   let from = 0;
 
   while (true) {
     const to = from + pageSize - 1;
-    const { data, error } = await baseQuery.range(from, to);
+    const { data, error } = await createPageQuery(from, to);
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     const rows = (data || []) as T[];
     allRows.push(...rows);
 
-    if (rows.length < pageSize) {
-      break;
-    }
-
+    if (rows.length < pageSize) break;
     from += pageSize;
   }
 
@@ -85,15 +86,23 @@ export async function GET(request: Request) {
     const supabase = getSupabaseClient();
     const { searchParams } = new URL(request.url);
     const dryRun = searchParams.get("dryRun") === "1";
+    const requestedSymbol = searchParams.get("symbol")?.trim().toUpperCase() || null;
 
-    const trades = await fetchAllPages<TradeRow>(
-      supabase
+    const trades = await fetchAllPages<TradeRow>((from, to) => {
+      let query = supabase
         .from("trades")
         .select(
           "trade_date, market, symbol, stock_name, side, shares, price, fee, tax, currency, split_from, split_to"
-        )
+        );
+
+      if (requestedSymbol) {
+        query = query.eq("symbol", requestedSymbol);
+      }
+
+      return query
         .order("trade_date", { ascending: true })
-    );
+        .range(from, to);
+    });
 
     const states = new Map<string, PositionState>();
 
@@ -102,9 +111,7 @@ export async function GET(request: Request) {
       const market = String(trade.market || "").trim().toUpperCase();
       const side = String(trade.side || "").trim().toLowerCase();
 
-      if (!symbol || !market) {
-        continue;
-      }
+      if (!symbol || !market) continue;
 
       const key = `${market}:${symbol}`;
       const stockName = String(trade.stock_name || symbol).trim() || symbol;
@@ -152,11 +159,12 @@ export async function GET(request: Request) {
         const splitTo = toNumber(trade.split_to);
 
         if (splitFrom > 0 && splitTo > 0 && state.shares > 0) {
-          state.shares = state.shares * (splitTo / splitFrom);
+          state.shares *= splitTo / splitFrom;
         }
       }
     }
 
+    const updatedAt = new Date().toISOString();
     const rowsToInsert = Array.from(states.values())
       .filter((state) => state.shares > 0.000001)
       .map((state) => ({
@@ -171,28 +179,28 @@ export async function GET(request: Request) {
         currency: state.currency,
         sector: null,
         note: "rebuilt from trades",
-        updated_at: new Date().toISOString(),
+        updated_at: updatedAt,
         name: state.stockName,
       }));
 
     if (!dryRun) {
-      const { error: deleteError } = await supabase
-        .from("positions")
-        .delete()
-        .neq("symbol", "__never_match__");
+      let deleteQuery = supabase.from("positions").delete();
 
-      if (deleteError) {
-        throw deleteError;
+      if (requestedSymbol) {
+        deleteQuery = deleteQuery.eq("symbol", requestedSymbol);
+      } else {
+        deleteQuery = deleteQuery.neq("symbol", "__never_match__");
       }
+
+      const { error: deleteError } = await deleteQuery;
+      if (deleteError) throw deleteError;
 
       if (rowsToInsert.length > 0) {
         const { error: insertError } = await supabase
           .from("positions")
           .insert(rowsToInsert);
 
-        if (insertError) {
-          throw insertError;
-        }
+        if (insertError) throw insertError;
       }
     }
 
@@ -201,6 +209,8 @@ export async function GET(request: Request) {
       startedAt,
       finishedAt: new Date().toISOString(),
       dryRun,
+      requestedSymbol,
+      mode: requestedSymbol ? "single-symbol" : "all-symbols",
       tradesCount: trades.length,
       positionsCount: rowsToInsert.length,
       insertedRows: dryRun ? 0 : rowsToInsert.length,
