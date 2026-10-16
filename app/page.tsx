@@ -90,6 +90,34 @@ type TradeRecord = {
   memo: string | null;
 };
 
+type TradeEditForm = {
+  trade_date: string;
+  side: string;
+  shares: string;
+  price: string;
+  cash_amount: string;
+  fee: string;
+  tax: string;
+  exchange_rate: string;
+  split_from: string;
+  split_to: string;
+  memo: string;
+};
+
+const emptyTradeEditForm: TradeEditForm = {
+  trade_date: "",
+  side: "buy",
+  shares: "",
+  price: "",
+  cash_amount: "",
+  fee: "",
+  tax: "",
+  exchange_rate: "1",
+  split_from: "",
+  split_to: "",
+  memo: "",
+};
+
 function toNumber(value: unknown, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -144,6 +172,12 @@ export default function Page() {
   const [tradeHistory, setTradeHistory] = useState<Record<string, TradeRecord[]>>({});
   const [tradeHistoryLoading, setTradeHistoryLoading] = useState<Record<string, boolean>>({});
   const [tradeHistoryError, setTradeHistoryError] = useState<Record<string, string>>({});
+  const [editingTrade, setEditingTrade] = useState<TradeRecord | null>(null);
+  const [tradeEditForm, setTradeEditForm] = useState<TradeEditForm>(emptyTradeEditForm);
+  const [savingTrade, setSavingTrade] = useState(false);
+  const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
+  const [tradeActionMessage, setTradeActionMessage] = useState("");
+  const [tradeActionError, setTradeActionError] = useState("");
 
   async function loadData() {
     setLoading(true);
@@ -272,6 +306,159 @@ export default function Page() {
         ...previous,
         [positionKey]: false,
       }));
+    }
+  }
+
+  function openTradeEditor(trade: TradeRecord) {
+    setTradeActionMessage("");
+    setTradeActionError("");
+    setEditingTrade(trade);
+    setTradeEditForm({
+      trade_date: trade.trade_date || "",
+      side: trade.side || "buy",
+      shares: trade.shares == null ? "" : String(trade.shares),
+      price: trade.price == null ? "" : String(trade.price),
+      cash_amount: trade.cash_amount == null ? "" : String(trade.cash_amount),
+      fee: trade.fee == null ? "" : String(trade.fee),
+      tax: trade.tax == null ? "" : String(trade.tax),
+      exchange_rate: trade.exchange_rate == null ? "1" : String(trade.exchange_rate),
+      split_from: trade.split_from == null ? "" : String(trade.split_from),
+      split_to: trade.split_to == null ? "" : String(trade.split_to),
+      memo: trade.memo || "",
+    });
+  }
+
+  function closeTradeEditor() {
+    if (savingTrade) return;
+    setEditingTrade(null);
+    setTradeEditForm(emptyTradeEditForm);
+  }
+
+  function optionalNumber(value: string) {
+    const trimmed = value.trim();
+    return trimmed === "" ? null : Number(trimmed);
+  }
+
+  async function rebuildPortfolioAfterTradeChange() {
+    const endDate = new Date().toISOString().slice(0, 10);
+    const response = await fetch(
+      `/api/portfolio/update-all?start=2024-08-06&end=${endDate}`,
+      { method: "GET", cache: "no-store" }
+    );
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.success) {
+      throw new Error(result?.error || "交易已寫入，但投資組合重算失敗");
+    }
+    return result;
+  }
+
+  async function refreshExpandedTradeHistory(market: string, symbol: string) {
+    const positionKey = `${market}:${symbol}`;
+    const { data, error } = await supabase
+      .from("trades")
+      .select(
+        "id, trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to, memo"
+      )
+      .eq("market", market)
+      .eq("symbol", symbol)
+      .order("trade_date", { ascending: false })
+      .order("id", { ascending: false });
+    if (error) throw error;
+    setTradeHistory((previous) => ({
+      ...previous,
+      [positionKey]: (data || []) as TradeRecord[],
+    }));
+  }
+
+  async function handleSaveTrade() {
+    if (!editingTrade) return;
+    setTradeActionError("");
+    setTradeActionMessage("");
+
+    if (!tradeEditForm.trade_date) {
+      setTradeActionError("請輸入交易日期。");
+      return;
+    }
+
+    const numericValues = [
+      tradeEditForm.shares,
+      tradeEditForm.price,
+      tradeEditForm.cash_amount,
+      tradeEditForm.fee,
+      tradeEditForm.tax,
+      tradeEditForm.exchange_rate,
+      tradeEditForm.split_from,
+      tradeEditForm.split_to,
+    ].filter((value) => value.trim() !== "");
+    if (numericValues.some((value) => !Number.isFinite(Number(value)))) {
+      setTradeActionError("數值欄位包含無效內容，請檢查後再儲存。");
+      return;
+    }
+
+    setSavingTrade(true);
+    try {
+      const updatedAt = new Date().toISOString();
+      const { error } = await supabase
+        .from("trades")
+        .update({
+          trade_date: tradeEditForm.trade_date,
+          side: tradeEditForm.side,
+          shares: optionalNumber(tradeEditForm.shares),
+          price: optionalNumber(tradeEditForm.price),
+          cash_amount: optionalNumber(tradeEditForm.cash_amount),
+          fee: optionalNumber(tradeEditForm.fee),
+          tax: optionalNumber(tradeEditForm.tax),
+          exchange_rate: optionalNumber(tradeEditForm.exchange_rate),
+          split_from: optionalNumber(tradeEditForm.split_from),
+          split_to: optionalNumber(tradeEditForm.split_to),
+          memo: tradeEditForm.memo.trim() || null,
+          updated_at: updatedAt,
+        })
+        .eq("id", editingTrade.id);
+      if (error) throw error;
+
+      setTradeActionMessage("交易更新成功，正在重新計算投資組合...");
+      await rebuildPortfolioAfterTradeChange();
+      await refreshExpandedTradeHistory(
+        editingTrade.market || getMarket(editingTrade.symbol),
+        editingTrade.symbol
+      );
+      await loadData();
+      setEditingTrade(null);
+      setTradeEditForm(emptyTradeEditForm);
+      setTradeActionMessage("交易已更新，投資組合也已重新計算完成。");
+    } catch (error: any) {
+      setTradeActionError(error?.message || String(error));
+    } finally {
+      setSavingTrade(false);
+    }
+  }
+
+  async function handleDeleteTrade(trade: TradeRecord) {
+    const confirmed = window.confirm(
+      `確定刪除 ${trade.trade_date} 的 ${trade.symbol} ${getTradeTypeLabel(trade.side)}交易嗎？此操作無法復原。`
+    );
+    if (!confirmed) return;
+
+    setDeletingTradeId(trade.id);
+    setTradeActionError("");
+    setTradeActionMessage("");
+    try {
+      const { error } = await supabase.from("trades").delete().eq("id", trade.id);
+      if (error) throw error;
+
+      setTradeActionMessage("交易刪除成功，正在重新計算投資組合...");
+      await rebuildPortfolioAfterTradeChange();
+      await refreshExpandedTradeHistory(
+        trade.market || getMarket(trade.symbol),
+        trade.symbol
+      );
+      await loadData();
+      setTradeActionMessage("交易已刪除，投資組合也已重新計算完成。");
+    } catch (error: any) {
+      setTradeActionError(error?.message || String(error));
+    } finally {
+      setDeletingTradeId(null);
     }
   }
 
@@ -412,6 +599,17 @@ export default function Page() {
             }`}
           >
             {updateMessage}
+          </div>
+        )}
+
+        {tradeActionMessage && (
+          <div className="rounded-2xl border border-green-200 bg-green-50 p-4 text-sm text-green-700 shadow-sm">
+            {tradeActionMessage}
+          </div>
+        )}
+        {tradeActionError && (
+          <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700 shadow-sm">
+            交易處理失敗：{tradeActionError}
           </div>
         )}
 
@@ -573,6 +771,7 @@ export default function Page() {
                                         "匯率",
                                         "分割比例",
                                         "Memo",
+                                        "操作",
                                       ].map((header) => (
                                         <th
                                           key={header}
@@ -628,6 +827,26 @@ export default function Page() {
                                             {splitLabel}
                                           </td>
                                           <td className="p-3">{trade.memo || "-"}</td>
+                                          <td className="whitespace-nowrap p-3">
+                                            <div className="flex gap-2">
+                                              <button
+                                                type="button"
+                                                onClick={() => openTradeEditor(trade)}
+                                                disabled={Boolean(deletingTradeId)}
+                                                className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
+                                              >
+                                                編輯
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => handleDeleteTrade(trade)}
+                                                disabled={Boolean(deletingTradeId)}
+                                                className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-red-300"
+                                              >
+                                                {deletingTradeId === trade.id ? "刪除中..." : "刪除"}
+                                              </button>
+                                            </div>
+                                          </td>
                                         </tr>
                                       );
                                     })}
@@ -653,6 +872,105 @@ export default function Page() {
           </p>
         </div>
 
+        {editingTrade && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-trade-title"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) closeTradeEditor();
+            }}
+          >
+            <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 id="edit-trade-title" className="text-xl font-bold text-slate-900">
+                    編輯交易
+                  </h2>
+                  <p className="mt-1 text-sm text-slate-500">
+                    {editingTrade.market || getMarket(editingTrade.symbol)} · {editingTrade.symbol} · {editingTrade.stock_name || editingTrade.symbol}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeTradeEditor}
+                  disabled={savingTrade}
+                  className="rounded-lg px-3 py-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed"
+                  aria-label="關閉編輯視窗"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="mt-5 grid gap-4 sm:grid-cols-2">
+                <TradeField label="交易日期">
+                  <input
+                    type="date"
+                    value={tradeEditForm.trade_date}
+                    onChange={(event) => setTradeEditForm((previous) => ({ ...previous, trade_date: event.target.value }))}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                  />
+                </TradeField>
+                <TradeField label="交易類型">
+                  <select
+                    value={tradeEditForm.side}
+                    onChange={(event) => setTradeEditForm((previous) => ({ ...previous, side: event.target.value }))}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                  >
+                    <option value="buy">買進</option>
+                    <option value="sell">賣出</option>
+                    <option value="dividend">股利</option>
+                    <option value="split">分割</option>
+                  </select>
+                </TradeField>
+                <TradeNumberField label="股數" value={tradeEditForm.shares} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, shares: value }))} />
+                <TradeNumberField label="價格" value={tradeEditForm.price} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, price: value }))} />
+                <TradeNumberField label="股利／現金" value={tradeEditForm.cash_amount} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, cash_amount: value }))} />
+                <TradeNumberField label="手續費" value={tradeEditForm.fee} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, fee: value }))} />
+                <TradeNumberField label="稅" value={tradeEditForm.tax} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, tax: value }))} />
+                <TradeNumberField label="匯率" value={tradeEditForm.exchange_rate} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, exchange_rate: value }))} />
+                <TradeNumberField label="分割前比例" value={tradeEditForm.split_from} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, split_from: value }))} />
+                <TradeNumberField label="分割後比例" value={tradeEditForm.split_to} onChange={(value) => setTradeEditForm((previous) => ({ ...previous, split_to: value }))} />
+                <TradeField label="Memo" className="sm:col-span-2">
+                  <textarea
+                    value={tradeEditForm.memo}
+                    onChange={(event) => setTradeEditForm((previous) => ({ ...previous, memo: event.target.value }))}
+                    rows={3}
+                    className="w-full resize-y rounded-xl border border-slate-300 px-3 py-2 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                    placeholder="選填"
+                  />
+                </TradeField>
+              </div>
+
+              {tradeActionError && (
+                <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {tradeActionError}
+                </div>
+              )}
+
+              <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={closeTradeEditor}
+                  disabled={savingTrade}
+                  className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSaveTrade}
+                  disabled={savingTrade}
+                  className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
+                >
+                  {savingTrade ? "儲存並重新計算中..." : "儲存修改"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {updateResult && (
           <pre className="overflow-x-auto rounded-2xl bg-slate-900 p-4 text-xs text-slate-100 shadow-sm">
             {JSON.stringify(updateResult, null, 2)}
@@ -660,6 +978,46 @@ export default function Page() {
         )}
       </section>
     </main>
+  );
+}
+
+function TradeField({
+  label,
+  children,
+  className = "",
+}: {
+  label: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <label className={`block ${className}`}>
+      <span className="mb-1.5 block text-sm font-medium text-slate-700">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function TradeNumberField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <TradeField label={label}>
+      <input
+        type="number"
+        inputMode="decimal"
+        step="any"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="w-full rounded-xl border border-slate-300 px-3 py-2 text-right outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+      />
+    </TradeField>
   );
 }
 
