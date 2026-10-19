@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabase";
 import PerformanceSummary from "./PerformanceSummary";
+import CopyForAIButton from "./CopyForAIButton";
 
 const twd = new Intl.NumberFormat("zh-TW", {
   style: "currency",
@@ -557,6 +558,8 @@ export default function Page() {
             >
               {updatingPortfolio ? "更新中..." : "一鍵更新投資組合"}
             </button>
+
+            <CopyForAIButton />
           </div>
         </div>
 
