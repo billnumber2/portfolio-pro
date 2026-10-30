@@ -25,7 +25,7 @@ const CHART_LEFT = 76;
 const CHART_RIGHT = 20;
 const CHART_TOP = 18;
 const CHART_BOTTOM = 46;
-const Y_AXIS_STEP = 500000;
+const Y_AXIS_STEP = 1_000_000;
 
 function formatTwd(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
@@ -98,14 +98,19 @@ function buildMonthTicks(rows: PerformanceRow[]) {
   return ticks;
 }
 
-export default function PerformanceSummary() {
+type PerformanceSummaryProps = {
+  refreshKey: number;
+};
+
+export default function PerformanceSummary({ refreshKey }: PerformanceSummaryProps) {
   const [rows, setRows] = useState<PerformanceRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const mountedRef = useRef(true);
+  const mountedRef = useRef(false);
+  const hasLoadedRef = useRef(false);
 
   const loadPerformance = useCallback(async (showInitialLoading = false) => {
     if (showInitialLoading) setLoading(true);
@@ -134,38 +139,17 @@ export default function PerformanceSummary() {
 
   useEffect(() => {
     mountedRef.current = true;
-    void loadPerformance(true);
-
-    const originalFetch = window.fetch.bind(window);
-
-    window.fetch = async (...args: Parameters<typeof window.fetch>) => {
-      const input = args[0];
-      const requestUrl =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url;
-
-      const response = await originalFetch(...args);
-
-      if (
-        response.ok &&
-        requestUrl.includes("/api/portfolio/update-all")
-      ) {
-        window.setTimeout(() => {
-          if (mountedRef.current) void loadPerformance(false);
-        }, 0);
-      }
-
-      return response;
-    };
 
     return () => {
       mountedRef.current = false;
-      window.fetch = originalFetch;
     };
-  }, [loadPerformance]);
+  }, []);
+
+  useEffect(() => {
+    const showInitialLoading = !hasLoadedRef.current;
+    hasLoadedRef.current = true;
+    void loadPerformance(showInitialLoading);
+  }, [loadPerformance, refreshKey]);
 
   const latest = rows[rows.length - 1];
   const first = rows[0];
@@ -238,19 +222,34 @@ export default function PerformanceSummary() {
   }, [displayRow]);
 
   function handleMouseMove(event: React.MouseEvent<SVGSVGElement>) {
-    if (!svgRef.current || rows.length === 0) return;
+    const svg = svgRef.current;
+    if (!svg || rows.length === 0) return;
 
-    const rect = svgRef.current.getBoundingClientRect();
-    const svgX = ((event.clientX - rect.left) / rect.width) * CHART_WIDTH;
-    const chartStart = CHART_LEFT;
-    const chartEnd = CHART_WIDTH - CHART_RIGHT;
-    const clampedX = Math.min(Math.max(svgX, chartStart), chartEnd);
-    const index = Math.round(
-      ((clampedX - chartStart) / (chartEnd - chartStart)) *
-        (rows.length - 1)
+    const screenMatrix = svg.getScreenCTM();
+    if (!screenMatrix) return;
+
+    const svgPoint = new DOMPoint(event.clientX, event.clientY).matrixTransform(
+      screenMatrix.inverse()
     );
 
-    setHoverIndex(Math.min(Math.max(index, 0), rows.length - 1));
+    const chartStart = CHART_LEFT;
+    const chartEnd = CHART_WIDTH - CHART_RIGHT;
+    const mouseX = Math.min(Math.max(svgPoint.x, chartStart), chartEnd);
+
+    let nearestIndex = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const pointX = getChartX(index, rows.length);
+      const distance = Math.abs(pointX - mouseX);
+
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = index;
+      }
+    }
+
+    setHoverIndex(nearestIndex);
   }
 
   if (loading) {

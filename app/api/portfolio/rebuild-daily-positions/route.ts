@@ -4,6 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 export const dynamic = "force-dynamic";
 
 type TradeRow = {
+  id: string;
+  created_at: string | null;
   trade_date: string;
   market: string | null;
   symbol: string;
@@ -41,6 +43,12 @@ type StockMasterRow = {
   yahoo_symbol: string;
 };
 
+type ExistingDailyRow = {
+  id: string | number;
+  position_date: string;
+  symbol: string;
+};
+
 type PositionState = {
   symbol: string;
   stockName: string | null;
@@ -68,6 +76,12 @@ function getSupabaseClient() {
   return createClient(supabaseUrl, supabaseKey);
 }
 
+function assertIsoDate(value: string, name: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(`${name} must use YYYY-MM-DD format.`);
+  }
+}
+
 function eachDate(startDate: string, endDate: string) {
   const dates: string[] = [];
   const start = new Date(`${startDate}T00:00:00.000Z`);
@@ -80,6 +94,11 @@ function eachDate(startDate: string, endDate: string) {
   }
 
   return dates;
+}
+
+function minDate(values: Array<string | null | undefined>) {
+  const valid = values.filter((value): value is string => Boolean(value));
+  return valid.length > 0 ? valid.reduce((left, right) => (left <= right ? left : right)) : null;
 }
 
 function toNumber(value: number | null | undefined, fallback = 0) {
@@ -109,29 +128,98 @@ function groupByDate<T extends { trade_date?: string; price_date?: string; rate_
   return map;
 }
 
-async function fetchAllPages<T>(baseQuery: any, pageSize = 1000): Promise<T[]> {
+async function fetchAllPages<T>(
+  createPageQuery: (from: number, to: number) => PromiseLike<{
+    data: T[] | null;
+    error: any;
+  }>,
+  pageSize = 1000
+): Promise<T[]> {
   const allRows: T[] = [];
   let from = 0;
 
   while (true) {
     const to = from + pageSize - 1;
-    const { data, error } = await baseQuery.range(from, to);
+    const { data, error } = await createPageQuery(from, to);
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     const rows = (data || []) as T[];
     allRows.push(...rows);
 
-    if (rows.length < pageSize) {
-      break;
-    }
-
+    if (rows.length < pageSize) break;
     from += pageSize;
   }
 
   return allRows;
+}
+
+function applyTrade(
+  state: PositionState,
+  trade: TradeRow,
+  lastUsdTwdRate: number | null
+) {
+  state.hasEverAppeared = true;
+  state.stockName = trade.stock_name || state.stockName;
+  state.market = trade.market || state.market;
+  state.currency = trade.currency || state.currency;
+
+  const side = (trade.side || "").toLowerCase();
+  const shares = toNumber(trade.shares);
+  const price = toNumber(trade.price);
+  const cashAmount = toNumber(trade.cash_amount);
+  const fee = toNumber(trade.fee);
+  const tax = toNumber(trade.tax);
+  const tradeFxRate = toNumber(
+    trade.exchange_rate,
+    state.currency === "USD" ? lastUsdTwdRate ?? 1 : 1
+  );
+  const fxRate = state.currency === "USD" ? tradeFxRate : 1;
+
+  if (side === "buy") {
+    const buyCostOriginal = shares * price + fee + tax;
+    const buyCostTwd = buyCostOriginal * fxRate;
+    state.costAmountOriginal += buyCostOriginal;
+    state.costAmountTwd += buyCostTwd;
+    state.shares += shares;
+  }
+
+  if (side === "sell") {
+    const sellShares = Math.min(shares, state.shares);
+    const avgCostOriginal = state.shares > 0 ? state.costAmountOriginal / state.shares : 0;
+    const avgCostTwd = state.shares > 0 ? state.costAmountTwd / state.shares : 0;
+    const soldCostOriginal = avgCostOriginal * sellShares;
+    const soldCostTwd = avgCostTwd * sellShares;
+    const proceedsOriginal = shares * price - fee - tax;
+    const proceedsTwd = proceedsOriginal * fxRate;
+    const realizedPnlTwd = proceedsTwd - soldCostTwd;
+
+    state.costAmountOriginal -= soldCostOriginal;
+    state.costAmountTwd -= soldCostTwd;
+    state.shares -= sellShares;
+    state.realizedPnlTwdToday += realizedPnlTwd;
+    state.cumulativeRealizedPnlTwd += realizedPnlTwd;
+
+    if (state.shares < 0.000001) state.shares = 0;
+    if (state.costAmountOriginal < 0.000001) state.costAmountOriginal = 0;
+    if (state.costAmountTwd < 0.000001) state.costAmountTwd = 0;
+  }
+
+  if (side === "dividend") {
+    const dividendOriginal = cashAmount - fee - tax;
+    const dividendTwd = dividendOriginal * fxRate;
+    state.realizedPnlTwdToday += dividendTwd;
+    state.cumulativeRealizedPnlTwd += dividendTwd;
+  }
+
+  if (side === "split") {
+    const splitFrom = toNumber(trade.split_from);
+    const splitTo = toNumber(trade.split_to);
+
+    if (splitFrom > 0 && splitTo > 0 && state.shares > 0) {
+      state.shares *= splitTo / splitFrom;
+    }
+  }
 }
 
 export async function GET(request: Request) {
@@ -140,70 +228,83 @@ export async function GET(request: Request) {
   try {
     const supabase = getSupabaseClient();
     const { searchParams } = new URL(request.url);
-
     const startDate = searchParams.get("start") || "2025-03-01";
     const endDate = searchParams.get("end") || new Date().toISOString().slice(0, 10);
-    const onlySymbol = searchParams.get("symbol");
+    const onlySymbol = searchParams.get("symbol")?.trim().toUpperCase() || null;
     const dryRun = searchParams.get("dryRun") === "1";
-    const clearExisting = searchParams.get("clear") === "1";
 
-    let stockQuery = supabase
-      .from("stock_master")
-      .select("symbol, stock_name, market, yahoo_symbol")
-      .order("symbol", { ascending: true });
+    assertIsoDate(startDate, "start");
+    assertIsoDate(endDate, "end");
 
-    if (onlySymbol) stockQuery = stockQuery.eq("symbol", onlySymbol);
+    if (startDate > endDate) {
+      throw new Error("start must be on or before end.");
+    }
 
-    const { data: stockData, error: stockError } = await stockQuery;
-    if (stockError) throw stockError;
+    const stocks = await fetchAllPages<StockMasterRow>((from, to) => {
+      let query = supabase
+        .from("stock_master")
+        .select("symbol, stock_name, market, yahoo_symbol");
 
-    const stocks = (stockData || []) as StockMasterRow[];
+      if (onlySymbol) query = query.eq("symbol", onlySymbol);
+
+      return query.order("symbol", { ascending: true }).range(from, to);
+    });
 
     if (stocks.length === 0) {
-      return NextResponse.json({
-        success: false,
-        error: "No stocks found in stock_master.",
-      });
+      return NextResponse.json(
+        {
+          success: false,
+          error: "No stocks found in stock_master.",
+        },
+        { status: 404 }
+      );
     }
 
     const symbols = stocks.map((item) => item.symbol);
 
-    let tradeQuery = supabase
-      .from("trades")
-      .select(
-        "trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to"
-      )
-      .in("symbol", symbols)
-      .lte("trade_date", endDate)
-      .order("trade_date", { ascending: true });
+    const trades = await fetchAllPages<TradeRow>((from, to) => {
+      let query = supabase
+        .from("trades")
+        .select(
+          "id, created_at, trade_date, market, symbol, stock_name, side, shares, price, cash_amount, currency, fee, tax, exchange_rate, split_from, split_to"
+        )
+        .in("symbol", symbols)
+        .lte("trade_date", endDate);
 
-    if (onlySymbol) tradeQuery = tradeQuery.eq("symbol", onlySymbol);
+      if (onlySymbol) query = query.eq("symbol", onlySymbol);
 
-    const trades = await fetchAllPages<TradeRow>(tradeQuery);
+      return query
+        .order("trade_date", { ascending: true })
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
 
-    const priceQuery = supabase
-      .from("historical_prices")
-      .select("symbol, price_date, close_price, yahoo_symbol")
-      .in("symbol", symbols)
-      .lte("price_date", endDate)
-      .order("price_date", { ascending: true });
+    const prices = await fetchAllPages<PriceRow>((from, to) =>
+      supabase
+        .from("historical_prices")
+        .select("symbol, price_date, close_price, yahoo_symbol")
+        .in("symbol", symbols)
+        .lte("price_date", endDate)
+        .order("price_date", { ascending: true })
+        .order("symbol", { ascending: true })
+        .range(from, to)
+    );
 
-    const prices = await fetchAllPages<PriceRow>(priceQuery);
-
-    const fxRateQuery = supabase
-      .from("historical_fx_rates")
-      .select("rate_date, from_currency, to_currency, rate")
-      .eq("from_currency", "USD")
-      .eq("to_currency", "TWD")
-      .lte("rate_date", endDate)
-      .order("rate_date", { ascending: true });
-
-    const fxRates = await fetchAllPages<FxRateRow>(fxRateQuery);
+    const fxRates = await fetchAllPages<FxRateRow>((from, to) =>
+      supabase
+        .from("historical_fx_rates")
+        .select("rate_date, from_currency, to_currency, rate")
+        .eq("from_currency", "USD")
+        .eq("to_currency", "TWD")
+        .lte("rate_date", endDate)
+        .order("rate_date", { ascending: true })
+        .range(from, to)
+    );
 
     const tradesByDate = groupByDate(trades, "trade_date");
     const pricesByDate = groupByDate(prices, "price_date");
     const fxRatesByDate = groupByDate(fxRates, "rate_date");
-
     const states = new Map<string, PositionState>();
     const lastCloseBySymbol = new Map<string, number>();
     const yahooSymbolBySymbol = new Map<string, string | null>();
@@ -226,8 +327,19 @@ export async function GET(request: Request) {
       yahooSymbolBySymbol.set(stock.symbol, stock.yahoo_symbol);
     }
 
+    // Replay from the earliest available event so the state at startDate is derived
+    // from complete trade history rather than incorrectly starting from zero.
+    const simulationStartDate =
+      minDate([
+        startDate,
+        trades[0]?.trade_date,
+        prices[0]?.price_date,
+        fxRates[0]?.rate_date,
+      ]) || startDate;
+
     const outputRows: any[] = [];
-    const dates = eachDate(startDate, endDate);
+    const outputKeys = new Set<string>();
+    const dates = eachDate(simulationStartDate, endDate);
     let skippedRowsDueToMissingFx = 0;
     let skippedRowsDueToMissingPrice = 0;
 
@@ -235,9 +347,7 @@ export async function GET(request: Request) {
       const todayFxRates = fxRatesByDate.get(date) || [];
       for (const fxRate of todayFxRates) {
         const rate = toNumber(fxRate.rate);
-        if (rate > 0) {
-          lastUsdTwdRate = rate;
-        }
+        if (rate > 0) lastUsdTwdRate = rate;
       }
 
       const todayPrices = pricesByDate.get(date) || [];
@@ -251,73 +361,12 @@ export async function GET(request: Request) {
       }
 
       const todayTrades = tradesByDate.get(date) || [];
-
       for (const trade of todayTrades) {
         const state = states.get(trade.symbol);
-        if (!state) continue;
-
-        state.hasEverAppeared = true;
-        state.stockName = trade.stock_name || state.stockName;
-        state.market = trade.market || state.market;
-        state.currency = trade.currency || state.currency;
-
-        const side = (trade.side || "").toLowerCase();
-        const shares = toNumber(trade.shares);
-        const price = toNumber(trade.price);
-        const cashAmount = toNumber(trade.cash_amount);
-        const fee = toNumber(trade.fee);
-        const tax = toNumber(trade.tax);
-        const tradeFxRate = toNumber(
-          trade.exchange_rate,
-          state.currency === "USD" ? lastUsdTwdRate ?? 1 : 1
-        );
-        const fxRate = state.currency === "USD" ? tradeFxRate : 1;
-
-        if (side === "buy") {
-          const buyCostOriginal = shares * price + fee + tax;
-          const buyCostTwd = buyCostOriginal * fxRate;
-          state.costAmountOriginal += buyCostOriginal;
-          state.costAmountTwd += buyCostTwd;
-          state.shares += shares;
-        }
-
-        if (side === "sell") {
-          const sellShares = Math.min(shares, state.shares);
-          const avgCostOriginal = state.shares > 0 ? state.costAmountOriginal / state.shares : 0;
-          const avgCostTwd = state.shares > 0 ? state.costAmountTwd / state.shares : 0;
-          const soldCostOriginal = avgCostOriginal * sellShares;
-          const soldCostTwd = avgCostTwd * sellShares;
-          const proceedsOriginal = shares * price - fee - tax;
-          const proceedsTwd = proceedsOriginal * fxRate;
-          const realizedPnlTwd = proceedsTwd - soldCostTwd;
-
-          state.costAmountOriginal -= soldCostOriginal;
-          state.costAmountTwd -= soldCostTwd;
-          state.shares -= sellShares;
-          state.realizedPnlTwdToday += realizedPnlTwd;
-          state.cumulativeRealizedPnlTwd += realizedPnlTwd;
-
-          if (state.shares < 0.000001) state.shares = 0;
-          if (state.costAmountOriginal < 0.000001) state.costAmountOriginal = 0;
-          if (state.costAmountTwd < 0.000001) state.costAmountTwd = 0;
-        }
-
-        if (side === "dividend") {
-          const dividendOriginal = cashAmount - fee - tax;
-          const dividendTwd = dividendOriginal * fxRate;
-          state.realizedPnlTwdToday += dividendTwd;
-          state.cumulativeRealizedPnlTwd += dividendTwd;
-        }
-
-        if (side === "split") {
-          const splitFrom = toNumber(trade.split_from);
-          const splitTo = toNumber(trade.split_to);
-          if (splitFrom > 0 && splitTo > 0 && state.shares > 0) {
-            const ratio = splitTo / splitFrom;
-            state.shares = state.shares * ratio;
-          }
-        }
+        if (state) applyTrade(state, trade, lastUsdTwdRate);
       }
+
+      if (date < startDate) continue;
 
       for (const state of states.values()) {
         const closePrice = lastCloseBySymbol.get(state.symbol);
@@ -344,7 +393,9 @@ export async function GET(request: Request) {
         const unrealizedPnlTwd = marketValueTwd - state.costAmountTwd;
         const unrealizedReturnRate =
           state.costAmountTwd > 0 ? unrealizedPnlTwd / state.costAmountTwd : null;
+        const key = `${date}|${state.symbol}`;
 
+        outputKeys.add(key);
         outputRows.push({
           position_date: date,
           market: state.market,
@@ -371,23 +422,29 @@ export async function GET(request: Request) {
       }
     }
 
+    const existingRows = await fetchAllPages<ExistingDailyRow>((from, to) => {
+      let query = supabase
+        .from("daily_stock_positions")
+        .select("id, position_date, symbol")
+        .gte("position_date", startDate)
+        .lte("position_date", endDate);
+
+      if (onlySymbol) query = query.eq("symbol", onlySymbol);
+
+      return query
+        .order("position_date", { ascending: true })
+        .order("symbol", { ascending: true })
+        .range(from, to);
+    });
+
+    const staleIds = existingRows
+      .filter((row) => !outputKeys.has(`${row.position_date}|${row.symbol}`))
+      .map((row) => row.id);
+
     if (!dryRun) {
-      if (clearExisting) {
-        let deleteQuery = supabase
-          .from("daily_stock_positions")
-          .delete()
-          .gte("position_date", startDate)
-          .lte("position_date", endDate);
-
-        if (onlySymbol) deleteQuery = deleteQuery.eq("symbol", onlySymbol);
-
-        const { error: deleteError } = await deleteQuery;
-        if (deleteError) throw deleteError;
-      }
-
-      const chunkSize = 500;
-      for (let index = 0; index < outputRows.length; index += chunkSize) {
-        const chunk = outputRows.slice(index, index + chunkSize);
+      const upsertChunkSize = 500;
+      for (let index = 0; index < outputRows.length; index += upsertChunkSize) {
+        const chunk = outputRows.slice(index, index + upsertChunkSize);
         const { error: upsertError } = await supabase
           .from("daily_stock_positions")
           .upsert(chunk, {
@@ -395,6 +452,19 @@ export async function GET(request: Request) {
           });
 
         if (upsertError) throw upsertError;
+      }
+
+      // Remove rows that should no longer exist only after all replacement rows have
+      // been written successfully. If an earlier step fails, the dirty cursor remains.
+      const deleteChunkSize = 200;
+      for (let index = 0; index < staleIds.length; index += deleteChunkSize) {
+        const chunk = staleIds.slice(index, index + deleteChunkSize);
+        const { error: deleteError } = await supabase
+          .from("daily_stock_positions")
+          .delete()
+          .in("id", chunk);
+
+        if (deleteError) throw deleteError;
       }
     }
 
@@ -404,14 +474,19 @@ export async function GET(request: Request) {
       finishedAt: new Date().toISOString(),
       startDate,
       endDate,
+      simulationStartDate,
       dryRun,
-      clearExisting,
+      onlySymbol,
+      exactRangeReplacement: true,
       symbolsCount: symbols.length,
       tradesCount: trades.length,
       pricesCount: prices.length,
       fxRatesCount: fxRates.length,
+      existingRowsInRange: existingRows.length,
       generatedRows: outputRows.length,
-      insertedRows: dryRun ? 0 : outputRows.length,
+      upsertedRows: dryRun ? 0 : outputRows.length,
+      staleRows: staleIds.length,
+      deletedRows: dryRun ? 0 : staleIds.length,
       skippedRowsDueToMissingPrice,
       skippedRowsDueToMissingFx,
     });

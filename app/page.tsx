@@ -28,8 +28,8 @@ const pct1 = new Intl.NumberFormat("zh-TW", {
 });
 
 const sharesFmt = new Intl.NumberFormat("zh-TW", {
-  minimumFractionDigits: 0,
-  maximumFractionDigits: 6,
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
 });
 
 const amountFmt = new Intl.NumberFormat("zh-TW", {
@@ -156,6 +156,7 @@ export default function Page() {
   const [updatingPortfolio, setUpdatingPortfolio] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
   const [updateResult, setUpdateResult] = useState<any>(null);
+  const [performanceRefreshKey, setPerformanceRefreshKey] = useState(0);
 
   const [expandedPositionKey, setExpandedPositionKey] = useState<string | null>(null);
   const [tradeHistory, setTradeHistory] = useState<Record<string, TradeRecord[]>>({});
@@ -459,6 +460,7 @@ export default function Page() {
       setExpandedPositionKey(null);
       setTradeHistory({});
       await loadData();
+      setPerformanceRefreshKey((current) => current + 1);
     } catch (error: any) {
       setUpdateMessage(error?.message || String(error));
     } finally {
@@ -599,7 +601,7 @@ export default function Page() {
           <KpiCard title="USD/TWD" value={fxRate.toFixed(2)} />
         </div>
 
-        <PerformanceSummary />
+        <PerformanceSummary refreshKey={performanceRefreshKey} />
 
         <div className="rounded-2xl bg-white p-5 shadow-sm">
           <h2 className="mb-4 text-lg font-semibold">最新庫存明細</h2>
