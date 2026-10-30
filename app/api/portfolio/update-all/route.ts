@@ -9,6 +9,28 @@ type RefreshStateRow = {
   trade_change_version: number;
 };
 
+type TimingStage =
+  | "loadResolveState"
+  | "updateFx"
+  | "syncYahooPrices"
+  | "rebuildPositions"
+  | "rebuildDailyPositions"
+  | "finalizeClearChangeState";
+
+type TimingsMs = Partial<Record<TimingStage, number>> & {
+  totalRequest?: number;
+};
+
+class StageTimingError extends Error {
+  readonly stage: TimingStage;
+
+  constructor(stage: TimingStage, error: unknown) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "StageTimingError";
+    this.stage = stage;
+  }
+}
+
 function getSupabaseClient() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey =
@@ -60,156 +82,240 @@ async function callJson(url: string) {
 
 export async function GET(request: Request) {
   const startedAt = new Date().toISOString();
+  const requestStartedMs = Date.now();
+  const timingsMs: TimingsMs = {};
+
+  async function measureStage<T>(stage: TimingStage, operation: () => Promise<T>): Promise<T> {
+    const stageStartedMs = Date.now();
+
+    try {
+      return await operation();
+    } catch (error: unknown) {
+      throw new StageTimingError(stage, error);
+    } finally {
+      timingsMs[stage] = Date.now() - stageStartedMs;
+    }
+  }
 
   try {
-    const supabase = getSupabaseClient();
-    const currentUrl = new URL(request.url);
-    const origin = currentUrl.origin;
-    const requestedStartDate = currentUrl.searchParams.get("start") || "2024-08-06";
-    const endDate =
-      currentUrl.searchParams.get("end") || new Date().toISOString().slice(0, 10);
-    const dryRun = currentUrl.searchParams.get("dryRun") === "1";
-    const forceFull = currentUrl.searchParams.get("forceFull") === "1";
+    const resolvedState = await measureStage("loadResolveState", async () => {
+      const supabase = getSupabaseClient();
+      const currentUrl = new URL(request.url);
+      const origin = currentUrl.origin;
+      const requestedStartDate = currentUrl.searchParams.get("start") || "2024-08-06";
+      const endDate =
+        currentUrl.searchParams.get("end") || new Date().toISOString().slice(0, 10);
+      const dryRun = currentUrl.searchParams.get("dryRun") === "1";
+      const forceFull = currentUrl.searchParams.get("forceFull") === "1";
 
-    assertIsoDate(requestedStartDate, "start");
-    assertIsoDate(endDate, "end");
+      assertIsoDate(requestedStartDate, "start");
+      assertIsoDate(endDate, "end");
 
-    if (requestedStartDate > endDate) {
-      throw new Error("start must be on or before end.");
-    }
+      if (requestedStartDate > endDate) {
+        throw new Error("start must be on or before end.");
+      }
 
-    const { data: refreshState, error: stateError } = await supabase
-      .from("portfolio_refresh_state")
-      .select("id, dirty_from_date, trade_change_version")
-      .eq("id", "global")
-      .maybeSingle();
+      const { data: refreshState, error: stateError } = await supabase
+        .from("portfolio_refresh_state")
+        .select("id, dirty_from_date, trade_change_version")
+        .eq("id", "global")
+        .maybeSingle();
 
-    if (stateError) throw stateError;
-    if (!refreshState) {
-      throw new Error(
-        "portfolio_refresh_state is missing. Run the supplied SQL migration before using update-all."
-      );
-    }
+      if (stateError) throw stateError;
+      if (!refreshState) {
+        throw new Error(
+          "portfolio_refresh_state is missing. Run the supplied SQL migration before using update-all."
+        );
+      }
 
-    const stateAtStart = refreshState as RefreshStateRow;
-    const dirtyFromDate = stateAtStart.dirty_from_date;
-    const tradeChangeVersion = Number(stateAtStart.trade_change_version);
-    const dirtyDateInRange =
-      dirtyFromDate && dirtyFromDate <= endDate ? dirtyFromDate : null;
-    const safeBaseStartDate =
-      minNullableDate(requestedStartDate, dirtyDateInRange) || requestedStartDate;
+      const stateAtStart = refreshState as RefreshStateRow;
+      const dirtyFromDate = stateAtStart.dirty_from_date;
+      const tradeChangeVersion = Number(stateAtStart.trade_change_version);
+      const dirtyDateInRange =
+        dirtyFromDate && dirtyFromDate <= endDate ? dirtyFromDate : null;
+      const safeBaseStartDate =
+        minNullableDate(requestedStartDate, dirtyDateInRange) || requestedStartDate;
 
-    const commonMarketParams =
-      `?start=${encodeURIComponent(safeBaseStartDate)}` +
-      `&end=${encodeURIComponent(endDate)}` +
-      (dryRun ? "&dryRun=1" : "") +
-      (forceFull ? "&forceFull=1" : "");
+      const commonMarketParams =
+        `?start=${encodeURIComponent(safeBaseStartDate)}` +
+        `&end=${encodeURIComponent(endDate)}` +
+        (dryRun ? "&dryRun=1" : "") +
+        (forceFull ? "&forceFull=1" : "");
+
+      return {
+        supabase,
+        origin,
+        requestedStartDate,
+        endDate,
+        dryRun,
+        forceFull,
+        dirtyFromDate,
+        tradeChangeVersion,
+        dirtyDateInRange,
+        safeBaseStartDate,
+        commonMarketParams,
+      };
+    });
+
+    const {
+      supabase,
+      origin,
+      requestedStartDate,
+      endDate,
+      dryRun,
+      forceFull,
+      dirtyFromDate,
+      tradeChangeVersion,
+      dirtyDateInRange,
+      safeBaseStartDate,
+      commonMarketParams,
+    } = resolvedState;
 
     // These two operations are independent. In normal mode each route starts at the
     // day after its latest stored market-data date; forceFull intentionally bypasses that.
     const [fxRatesResult, syncPricesResult] = await Promise.all([
-      callJson(`${origin}/api/fx/update-rates${commonMarketParams}`),
-      callJson(`${origin}/api/yahoo/sync-historical-prices${commonMarketParams}`),
+      measureStage("updateFx", () =>
+        callJson(`${origin}/api/fx/update-rates${commonMarketParams}`)
+      ),
+      measureStage("syncYahooPrices", () =>
+        callJson(`${origin}/api/yahoo/sync-historical-prices${commonMarketParams}`)
+      ),
     ]);
 
-    const shouldRebuildPositions = forceFull || Boolean(dirtyDateInRange);
-    const rebuildPositionsResult = shouldRebuildPositions
-      ? await callJson(
-          `${origin}/api/portfolio/rebuild-positions${dryRun ? "?dryRun=1" : ""}`
-        )
-      : {
-          success: true,
-          skipped: true,
-          skipReason: "no_trade_changes",
-          mode: "full-scan-not-needed",
-        };
-
-    const { data: latestDailyRow, error: latestDailyError } = await supabase
-      .from("daily_stock_positions")
-      .select("position_date")
-      .order("position_date", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (latestDailyError) throw latestDailyError;
-
-    const latestDailyDate: string | null = latestDailyRow?.position_date || null;
-    const missingDailyStartDate = !latestDailyDate
-      ? safeBaseStartDate
-      : latestDailyDate < endDate
-        ? maxDate(safeBaseStartDate, addDays(latestDailyDate, 1))
-        : null;
-    const earliestMarketDataDate = minNullableDate(
-      fxRatesResult.earliestInsertedDate,
-      syncPricesResult.earliestInsertedDate
-    );
-
-    const dailyRebuildStartDate = forceFull
-      ? safeBaseStartDate
-      : minNullableDate(
-          dirtyDateInRange,
-          missingDailyStartDate,
-          earliestMarketDataDate
-        );
-
-    const rebuildDailyPositionsResult =
-      dailyRebuildStartDate && dailyRebuildStartDate <= endDate
+    const rebuildPositionsResult = await measureStage("rebuildPositions", async () => {
+      const shouldRebuildPositions = forceFull || Boolean(dirtyDateInRange);
+      return shouldRebuildPositions
         ? await callJson(
-            `${origin}/api/portfolio/rebuild-daily-positions` +
-              `?start=${encodeURIComponent(dailyRebuildStartDate)}` +
-              `&end=${encodeURIComponent(endDate)}` +
-              (dryRun ? "&dryRun=1" : "")
+            `${origin}/api/portfolio/rebuild-positions${dryRun ? "?dryRun=1" : ""}`
           )
         : {
             success: true,
             skipped: true,
-            skipReason: "daily_positions_up_to_date",
+            skipReason: "no_trade_changes",
+            mode: "full-scan-not-needed",
           };
+    });
 
-    let refreshStateUpdated = false;
-    let dirtyStateCleared = false;
-    let concurrentTradeChangeDetected = false;
-
-    // This is deliberately the final mutation. The version predicate makes the clear
-    // race-safe: if another trade changes during this run, zero rows are updated and
-    // the new dirty state remains for the next run.
-    if (!dryRun) {
-      const canClearDirty = Boolean(dirtyDateInRange);
-      const statePatch: Record<string, unknown> = {
-        last_successful_refresh_at: new Date().toISOString(),
-        last_refresh_from_date: dailyRebuildStartDate || endDate,
-        last_refresh_to_date: endDate,
-        updated_at: new Date().toISOString(),
-      };
-
-      if (!dirtyFromDate || canClearDirty) {
-        statePatch.last_successful_trade_version = tradeChangeVersion;
-      }
-
-      if (canClearDirty) {
-        statePatch.dirty_from_date = null;
-      }
-
-      let stateUpdateQuery = supabase
-        .from("portfolio_refresh_state")
-        .update(statePatch)
-        .eq("id", "global")
-        .eq("trade_change_version", tradeChangeVersion);
-
-      if (canClearDirty && dirtyFromDate) {
-        stateUpdateQuery = stateUpdateQuery.eq("dirty_from_date", dirtyFromDate);
-      }
-
-      const { data: updatedState, error: stateUpdateError } = await stateUpdateQuery
-        .select("id, dirty_from_date, trade_change_version")
+    const dailyStageResult = await measureStage("rebuildDailyPositions", async () => {
+      const { data: latestDailyRow, error: latestDailyError } = await supabase
+        .from("daily_stock_positions")
+        .select("position_date")
+        .order("position_date", { ascending: false })
+        .limit(1)
         .maybeSingle();
 
-      if (stateUpdateError) throw stateUpdateError;
+      if (latestDailyError) throw latestDailyError;
 
-      refreshStateUpdated = Boolean(updatedState);
-      dirtyStateCleared = canClearDirty && Boolean(updatedState);
-      concurrentTradeChangeDetected = !updatedState;
-    }
+      const latestDailyDate: string | null = latestDailyRow?.position_date || null;
+      const missingDailyStartDate = !latestDailyDate
+        ? safeBaseStartDate
+        : latestDailyDate < endDate
+          ? maxDate(safeBaseStartDate, addDays(latestDailyDate, 1))
+          : null;
+      const earliestMarketDataDate = minNullableDate(
+        fxRatesResult.earliestInsertedDate,
+        syncPricesResult.earliestInsertedDate
+      );
+
+      const dailyRebuildStartDate = forceFull
+        ? safeBaseStartDate
+        : minNullableDate(
+            dirtyDateInRange,
+            missingDailyStartDate,
+            earliestMarketDataDate
+          );
+
+      const rebuildDailyPositionsResult =
+        dailyRebuildStartDate && dailyRebuildStartDate <= endDate
+          ? await callJson(
+              `${origin}/api/portfolio/rebuild-daily-positions` +
+                `?start=${encodeURIComponent(dailyRebuildStartDate)}` +
+                `&end=${encodeURIComponent(endDate)}` +
+                (dryRun ? "&dryRun=1" : "")
+            )
+          : {
+              success: true,
+              skipped: true,
+              skipReason: "daily_positions_up_to_date",
+            };
+
+      return {
+        latestDailyDate,
+        missingDailyStartDate,
+        earliestMarketDataDate,
+        dailyRebuildStartDate,
+        rebuildDailyPositionsResult,
+      };
+    });
+
+    const {
+      latestDailyDate,
+      missingDailyStartDate,
+      earliestMarketDataDate,
+      dailyRebuildStartDate,
+      rebuildDailyPositionsResult,
+    } = dailyStageResult;
+
+    const finalizeResult = await measureStage("finalizeClearChangeState", async () => {
+      let refreshStateUpdated = false;
+      let dirtyStateCleared = false;
+      let concurrentTradeChangeDetected = false;
+
+      // This is deliberately the final mutation. The version predicate makes the clear
+      // race-safe: if another trade changes during this run, zero rows are updated and
+      // the new dirty state remains for the next run.
+      if (!dryRun) {
+        const canClearDirty = Boolean(dirtyDateInRange);
+        const statePatch: Record<string, unknown> = {
+          last_successful_refresh_at: new Date().toISOString(),
+          last_refresh_from_date: dailyRebuildStartDate || endDate,
+          last_refresh_to_date: endDate,
+          updated_at: new Date().toISOString(),
+        };
+
+        if (!dirtyFromDate || canClearDirty) {
+          statePatch.last_successful_trade_version = tradeChangeVersion;
+        }
+
+        if (canClearDirty) {
+          statePatch.dirty_from_date = null;
+        }
+
+        let stateUpdateQuery = supabase
+          .from("portfolio_refresh_state")
+          .update(statePatch)
+          .eq("id", "global")
+          .eq("trade_change_version", tradeChangeVersion);
+
+        if (canClearDirty && dirtyFromDate) {
+          stateUpdateQuery = stateUpdateQuery.eq("dirty_from_date", dirtyFromDate);
+        }
+
+        const { data: updatedState, error: stateUpdateError } = await stateUpdateQuery
+          .select("id, dirty_from_date, trade_change_version")
+          .maybeSingle();
+
+        if (stateUpdateError) throw stateUpdateError;
+
+        refreshStateUpdated = Boolean(updatedState);
+        dirtyStateCleared = canClearDirty && Boolean(updatedState);
+        concurrentTradeChangeDetected = !updatedState;
+      }
+
+      return {
+        refreshStateUpdated,
+        dirtyStateCleared,
+        concurrentTradeChangeDetected,
+      };
+    });
+
+    const {
+      refreshStateUpdated,
+      dirtyStateCleared,
+      concurrentTradeChangeDetected,
+    } = finalizeResult;
+
+    timingsMs.totalRequest = Date.now() - requestStartedMs;
 
     return NextResponse.json({
       success: true,
@@ -238,12 +344,18 @@ export async function GET(request: Request) {
         rebuildPositions: rebuildPositionsResult,
         rebuildDailyPositions: rebuildDailyPositionsResult,
       },
+      timingsMs,
     });
   } catch (error: any) {
+    timingsMs.totalRequest = Date.now() - requestStartedMs;
+
     return NextResponse.json(
       {
         success: false,
         error: error?.message || String(error),
+        timingsMs,
+        failedStage:
+          error instanceof StageTimingError ? error.stage : "loadResolveState",
       },
       { status: 500 }
     );
