@@ -480,6 +480,8 @@ export default function Page() {
       const costTwd = toNumber(item.cost_amount_twd);
       const valueTwd = toNumber(item.market_value_twd);
       const pnlTwd = toNumber(item.unrealized_pnl_twd);
+      const realizedPnlTwd = toNumber(item.cumulative_realized_pnl_twd);
+      const totalPnlTwd = pnlTwd + realizedPnlTwd;
       const returnRate = toNumber(item.unrealized_return_rate);
 
       return {
@@ -493,6 +495,8 @@ export default function Page() {
         costTwd,
         valueTwd,
         pnlTwd,
+        realizedPnlTwd,
+        totalPnlTwd,
         returnRate,
         weight: 0,
       };
@@ -613,14 +617,11 @@ export default function Page() {
             </div>
           )}
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="bg-slate-100">
+          <div className="max-h-[70vh] overflow-auto">
+            <table className="w-full min-w-[1100px] text-sm">
+              <thead className="sticky top-0 z-20 bg-slate-100 shadow-sm">
                 <tr>
                   {[
-                    "",
-                    "市場",
-                    "代碼",
                     "名稱",
                     "股數",
                     "平均成本",
@@ -628,12 +629,14 @@ export default function Page() {
                     "幣別",
                     "現值",
                     "未實現損益",
-                    "報酬率",
+                    "未實現報酬率",
+                    "已實現損益",
+                    "總損益",
                     "占比",
                   ].map((header, headerIndex) => (
                     <th
                       key={`${header}-${headerIndex}`}
-                      className={headerIndex === 0 ? "w-10 p-3 text-center" : "p-3 text-left"}
+                      className="whitespace-nowrap bg-slate-100 p-3 text-left"
                     >
                       {header}
                     </th>
@@ -656,17 +659,7 @@ export default function Page() {
                         onClick={() => handleExpandPosition(row.market, row.symbol)}
                         aria-expanded={isExpanded}
                       >
-                        <td className="p-3 text-center text-slate-500">
-                          <span
-                            className={`inline-block transition-transform ${isExpanded ? "rotate-90" : ""}`}
-                            aria-hidden="true"
-                          >
-                            ▶
-                          </span>
-                        </td>
-                        <td className="p-3">{row.market}</td>
-                        <td className="p-3 font-medium text-blue-700">{row.symbol}</td>
-                        <td className="p-3">{row.name}</td>
+                        <td className="p-3 font-medium text-slate-900">{row.name}</td>
                         <td className="p-3 text-right">{sharesFmt.format(row.shares)}</td>
                         <td className="p-3 text-right">{num1.format(row.avgCost)}</td>
                         <td className="p-3 text-right">{num1.format(row.price)}</td>
@@ -686,12 +679,26 @@ export default function Page() {
                         >
                           {pct1.format(row.returnRate)}
                         </td>
+                        <td
+                          className={`p-3 text-right font-medium ${
+                            row.realizedPnlTwd >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {twd.format(row.realizedPnlTwd)}
+                        </td>
+                        <td
+                          className={`p-3 text-right font-semibold ${
+                            row.totalPnlTwd >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {twd.format(row.totalPnlTwd)}
+                        </td>
                         <td className="p-3 text-right">{pct1.format(row.weight)}</td>
                       </tr>
 
                       {isExpanded && (
                         <tr className="border-t">
-                          <td colSpan={12} className="bg-slate-50 p-4 sm:p-5">
+                          <td colSpan={11} className="bg-slate-50 p-4 sm:p-5">
                             <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                               <div>
                                 <p className="font-semibold text-slate-900">
