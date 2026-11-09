@@ -21,13 +21,33 @@ type TimingsMs = Partial<Record<TimingStage, number>> & {
   totalRequest?: number;
 };
 
+class JsonRequestError extends Error {
+  readonly url: string;
+  readonly status: number;
+  readonly responseData: any;
+
+  constructor(url: string, status: number, responseData: any) {
+    super(
+      responseData?.error ||
+        responseData?.message ||
+        `Request failed with status ${status}: ${url}`
+    );
+    this.name = "JsonRequestError";
+    this.url = url;
+    this.status = status;
+    this.responseData = responseData;
+  }
+}
+
 class StageTimingError extends Error {
   readonly stage: TimingStage;
+  readonly originalError: unknown;
 
   constructor(stage: TimingStage, error: unknown) {
     super(error instanceof Error ? error.message : String(error));
     this.name = "StageTimingError";
     this.stage = stage;
+    this.originalError = error;
   }
 }
 
@@ -74,10 +94,37 @@ async function callJson(url: string) {
   const data = await response.json().catch(() => null);
 
   if (!response.ok || !data?.success) {
-    throw new Error(data?.error || data?.message || `Request failed: ${url}`);
+    throw new JsonRequestError(url, response.status, data);
   }
 
   return data;
+}
+
+function getJsonRequestError(error: unknown): JsonRequestError | null {
+  const originalError =
+    error instanceof StageTimingError ? error.originalError : error;
+
+  return originalError instanceof JsonRequestError ? originalError : null;
+}
+
+function getFailedSymbols(responseData: any) {
+  if (!Array.isArray(responseData?.results)) return [];
+
+  return responseData.results
+    .filter((item: any) => item?.status === "failed")
+    .map((item: any) => ({
+      symbol: item?.symbol ?? null,
+      yahooSymbol: item?.yahooSymbol ?? null,
+      currentShares: item?.currentShares ?? null,
+      latestExistingDate: item?.latestExistingDate ?? null,
+      effectiveStartDate: item?.effectiveStartDate ?? null,
+      effectiveEndDate: item?.effectiveEndDate ?? null,
+      fetchedRows: item?.fetchedRows ?? 0,
+      insertedRows: item?.insertedRows ?? 0,
+      status: item?.status ?? "failed",
+      warnings: Array.isArray(item?.warnings) ? item.warnings : [],
+      error: item?.error ?? "Unknown Yahoo sync error.",
+    }));
 }
 
 export async function GET(request: Request) {
@@ -349,6 +396,10 @@ export async function GET(request: Request) {
   } catch (error: any) {
     timingsMs.totalRequest = Date.now() - requestStartedMs;
 
+    const jsonRequestError = getJsonRequestError(error);
+    const responseData = jsonRequestError?.responseData ?? null;
+    const failedSymbols = getFailedSymbols(responseData);
+
     return NextResponse.json(
       {
         success: false,
@@ -356,6 +407,21 @@ export async function GET(request: Request) {
         timingsMs,
         failedStage:
           error instanceof StageTimingError ? error.stage : "loadResolveState",
+        failedRequest: jsonRequestError
+          ? {
+              url: jsonRequestError.url,
+              status: jsonRequestError.status,
+              startDate: responseData?.startDate ?? null,
+              endDate: responseData?.endDate ?? null,
+              onlySymbol: responseData?.onlySymbol ?? null,
+              forceFull: responseData?.forceFull ?? null,
+              dryRun: responseData?.dryRun ?? null,
+              symbolsCount: responseData?.symbolsCount ?? null,
+              symbolsFetched: responseData?.symbolsFetched ?? null,
+              failedCount: responseData?.failedCount ?? failedSymbols.length,
+            }
+          : null,
+        failedSymbols,
       },
       { status: 500 }
     );

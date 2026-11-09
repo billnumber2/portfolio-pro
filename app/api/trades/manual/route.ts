@@ -3,6 +3,10 @@ import { createClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
 
+const YAHOO_CHART_TIMEOUT_MS = 6_000;
+const YAHOO_CHART_BASE_URL =
+  "https://query1.finance.yahoo.com/v8/finance/chart";
+
 type ManualTradePayload = {
   id?: string;
   trade_date?: string;
@@ -20,6 +24,25 @@ type ManualTradePayload = {
   split_to?: string | number;
   memo?: string;
 };
+
+type StockMasterPayload = {
+  symbol: string;
+  stock_name: string;
+  market: string;
+  yahoo_symbol: string | null;
+  sector: null;
+  asset_type: "stock";
+};
+
+class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 function getSupabaseClient() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -53,10 +76,6 @@ function normalizeSymbol(value: unknown) {
 
 function getCurrency(market: string) {
   return market === "US" ? "USD" : "TWD";
-}
-
-function getYahooSymbol(market: string, symbol: string) {
-  return market === "TW" ? `${symbol}.TW` : symbol;
 }
 
 function buildPayload(body: ManualTradePayload) {
@@ -102,23 +121,187 @@ function buildPayload(body: ManualTradePayload) {
       memo: normalizeText(body.memo) || "manual",
     },
 
-    stockMasterPayload: {
+    stockMasterBase: {
       symbol,
       stock_name: stockName,
       market,
-      yahoo_symbol: getYahooSymbol(
-        market,
-        symbol
-      ),
       sector: null,
-      asset_type: "stock",
+      asset_type: "stock" as const,
     },
+  };
+}
+
+function isYahooNotFoundError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const yahooError = error as {
+    code?: unknown;
+    description?: unknown;
+  };
+
+  const message = `${String(yahooError.code || "")} ${String(
+    yahooError.description || ""
+  )}`;
+
+  return /not found|no data found|delisted|invalid symbol/i.test(
+    message
+  );
+}
+
+async function validateYahooSymbol(yahooSymbol: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    YAHOO_CHART_TIMEOUT_MS
+  );
+
+  let response: Response;
+
+  try {
+    const url = `${YAHOO_CHART_BASE_URL}/${encodeURIComponent(
+      yahooSymbol
+    )}?range=5d&interval=1d`;
+
+    response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "portfolio-pro/1.0",
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (error: any) {
+    if (error?.name === "AbortError") {
+      throw new ApiError(
+        503,
+        `Yahoo ticker validation timed out for ${yahooSymbol}. No stock_master or trade changes were made. Please retry later.`
+      );
+    }
+
+    throw new ApiError(
+      503,
+      `Yahoo ticker validation failed temporarily for ${yahooSymbol} because of a network error. No stock_master or trade changes were made. Please retry later.`
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (response.status === 404) {
+    return false;
+  }
+
+  if (response.status === 429 || response.status >= 500) {
+    throw new ApiError(
+      503,
+      `Yahoo ticker validation is temporarily unavailable for ${yahooSymbol} (HTTP ${response.status}). No stock_master or trade changes were made. Please retry later.`
+    );
+  }
+
+  if (!response.ok) {
+    throw new ApiError(
+      503,
+      `Yahoo ticker validation could not be completed for ${yahooSymbol} (HTTP ${response.status}). No stock_master or trade changes were made. Please retry later.`
+    );
+  }
+
+  let payload: any;
+
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError(
+      503,
+      `Yahoo ticker validation returned an unreadable response for ${yahooSymbol}. No stock_master or trade changes were made. Please retry later.`
+    );
+  }
+
+  const chartError = payload?.chart?.error;
+
+  if (chartError) {
+    if (isYahooNotFoundError(chartError)) {
+      return false;
+    }
+
+    throw new ApiError(
+      503,
+      `Yahoo ticker validation returned a temporary error for ${yahooSymbol}. No stock_master or trade changes were made. Please retry later.`
+    );
+  }
+
+  if (
+    Array.isArray(payload?.chart?.result) &&
+    payload.chart.result.length > 0
+  ) {
+    return true;
+  }
+
+  throw new ApiError(
+    503,
+    `Yahoo ticker validation returned an unexpected response for ${yahooSymbol}. No stock_master or trade changes were made. Please retry later.`
+  );
+}
+
+async function resolveTaiwanYahooSymbol(symbol: string) {
+  const candidates = [`${symbol}.TW`, `${symbol}.TWO`];
+
+  for (const candidate of candidates) {
+    const isValid = await validateYahooSymbol(candidate);
+
+    if (isValid) {
+      return candidate;
+    }
+  }
+
+  throw new ApiError(
+    422,
+    `No valid Yahoo ticker found for TW symbol ${symbol}. Tried ${candidates.join(
+      " and "
+    )}. No stock_master or trade changes were made.`
+  );
+}
+
+async function resolveStockMasterPayload(
+  supabase: any,
+  stockMasterBase: {
+    symbol: string;
+    stock_name: string;
+    market: string;
+    sector: null;
+    asset_type: "stock";
+  }
+): Promise<StockMasterPayload> {
+  const { data: existingStockMaster, error } = await supabase
+    .from("stock_master")
+    .select("symbol, yahoo_symbol")
+    .eq("symbol", stockMasterBase.symbol)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  if (existingStockMaster) {
+    return {
+      ...stockMasterBase,
+      yahoo_symbol: existingStockMaster.yahoo_symbol,
+    };
+  }
+
+  const yahooSymbol =
+    stockMasterBase.market === "TW"
+      ? await resolveTaiwanYahooSymbol(stockMasterBase.symbol)
+      : stockMasterBase.symbol;
+
+  return {
+    ...stockMasterBase,
+    yahoo_symbol: yahooSymbol,
   };
 }
 
 async function upsertStockMaster(
   supabase: any,
-  stockMasterPayload: any
+  stockMasterPayload: StockMasterPayload
 ) {
   const { error } = await supabase
     .from("stock_master")
@@ -156,6 +339,10 @@ async function findDuplicateTrade(
   if (error) throw error;
 
   return data?.[0] || null;
+}
+
+function getErrorStatus(error: unknown) {
+  return error instanceof ApiError ? error.status : 500;
 }
 
 export async function GET(request: Request) {
@@ -226,7 +413,7 @@ export async function POST(request: Request) {
 
     const {
       tradePayload,
-      stockMasterPayload,
+      stockMasterBase,
     } = buildPayload(body);
 
     const duplicate =
@@ -247,6 +434,17 @@ export async function POST(request: Request) {
       );
     }
 
+    const stockMasterPayload =
+      await resolveStockMasterPayload(
+        supabase,
+        stockMasterBase
+      );
+
+    await upsertStockMaster(
+      supabase,
+      stockMasterPayload
+    );
+
     const {
       data: insertedTrade,
       error: insertError,
@@ -259,11 +457,6 @@ export async function POST(request: Request) {
       .single();
 
     if (insertError) throw insertError;
-
-    await upsertStockMaster(
-      supabase,
-      stockMasterPayload
-    );
 
     return NextResponse.json({
       success: true,
@@ -278,7 +471,7 @@ export async function POST(request: Request) {
           error?.message || String(error),
       },
       {
-        status: 500,
+        status: getErrorStatus(error),
       }
     );
   }
@@ -305,7 +498,7 @@ export async function PATCH(request: Request) {
 
     const {
       tradePayload,
-      stockMasterPayload,
+      stockMasterBase,
     } = buildPayload(body);
 
     const duplicate =
@@ -327,6 +520,17 @@ export async function PATCH(request: Request) {
       );
     }
 
+    const stockMasterPayload =
+      await resolveStockMasterPayload(
+        supabase,
+        stockMasterBase
+      );
+
+    await upsertStockMaster(
+      supabase,
+      stockMasterPayload
+    );
+
     const {
       data: updatedTrade,
       error: updateError,
@@ -341,11 +545,6 @@ export async function PATCH(request: Request) {
 
     if (updateError) throw updateError;
 
-    await upsertStockMaster(
-      supabase,
-      stockMasterPayload
-    );
-
     return NextResponse.json({
       success: true,
       trade: updatedTrade,
@@ -358,7 +557,7 @@ export async function PATCH(request: Request) {
           error?.message || String(error),
       },
       {
-        status: 500,
+        status: getErrorStatus(error),
       }
     );
   }
